@@ -137,6 +137,7 @@ class Policy:
   ask_user: AskUserHandler | None = None
   name: str = ""
   reason: str = ""
+  server_name: str = ""
 
   def __post_init__(self) -> None:
     object.__setattr__(
@@ -252,6 +253,7 @@ def _mcp_policies(
             name=policy_name,
             ask_user=handler,
             reason=reason,
+            server_name=server,
         )
     ]
 
@@ -268,6 +270,7 @@ def _mcp_policies(
             name=policy_name,
             ask_user=handler,
             reason=reason,
+            server_name=server,
         )
     )
   return policies
@@ -684,8 +687,26 @@ async def _execute_ask_user(
   return bool(result)
 
 
-def _matches_target(policy_tool: str, tool_call: types.ToolCall) -> bool:
+def _matches_target(
+    policy_target: str | Policy,
+    tool_call: types.ToolCall,
+) -> bool:
   """Matches a policy tool definition against a tool call target."""
+  if isinstance(policy_target, Policy):
+    p = policy_target
+    if p.server_name:
+      if tool_call.server_name != p.server_name:
+        return False
+      raw_tool = p.tool
+      if "/" in raw_tool:
+        raw_tool, _ = _parse_tool_target(raw_tool)
+      if raw_tool in (_WILDCARD, "*"):
+        return True
+      return raw_tool == tool_call.name
+    policy_tool = p.tool
+  else:
+    policy_tool = policy_target
+
   if policy_tool == _WILDCARD:
     return True
   if tool_call.server_name:
@@ -718,7 +739,7 @@ class _PolicyDecideHook(hooks.PreToolCallDecideHook):
         # are enforced at the platform/execution layer.
         continue
 
-      if not _matches_target(p.tool, tool_call):
+      if not _matches_target(p, tool_call):
         continue
 
       try:
@@ -870,8 +891,13 @@ def _to_policy_config_proto(
       auto_policy = p
       continue
 
-    # TODO: Remove _parse_tool_target once Policy has server_name.
-    tool_name, server_name = _parse_tool_target(p.tool)
+    if p.server_name:
+      server_name = p.server_name
+      tool_name = p.tool
+      if "/" in tool_name:
+        tool_name, _ = _parse_tool_target(tool_name)
+    else:
+      tool_name, server_name = _parse_tool_target(p.tool)
     is_workspace_only = p.name == _WORKSPACE_ONLY_POLICY_NAME
     if is_workspace_only:
       has_workspace_only = True
@@ -934,7 +960,10 @@ def _to_policy_config_proto(
 
 def _policy_sort_key(p: Policy) -> tuple[int, int]:
   """Returns a sort key ordering specific before wildcards, and DENY before APPROVE."""
-  scope = 2 if p.tool == _WILDCARD else (1 if p.tool.endswith("/*") else 0)
+  if p.server_name:
+    scope = 1 if p.tool in (_WILDCARD, "*") or p.tool.endswith("/*") else 0
+  else:
+    scope = 2 if p.tool == _WILDCARD else (1 if p.tool.endswith("/*") else 0)
   decision_order = {
       Decision.DENY: 0,
       Decision.ASK_USER: 1,
@@ -965,7 +994,8 @@ def enforce(
 
   # Validate MCP policies against mcp_servers (Fail-Closed Security Guard)
   has_mcp_policy = any(
-      ("/" in p.tool and p.tool != _WILDCARD) for p in flat_policies
+      bool(p.server_name) or ("/" in p.tool and p.tool != _WILDCARD)
+      for p in flat_policies
   )
   if has_mcp_policy and mcp_servers is None:
     raise ValueError(

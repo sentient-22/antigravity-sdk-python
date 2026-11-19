@@ -1463,5 +1463,58 @@ class AutoPolicyTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(res_mcp.allow)
 
 
+class ExplicitServerNamePolicyTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for explicit server_name field on Policy dataclass."""
+
+  def test_explicit_server_name_proto_serialization(self):
+    p = policy.Policy(
+        tool="query",
+        decision=policy.Decision.DENY,
+        server_name="postgres",
+        reason="No raw DB queries",
+    )
+    self.assertEqual(p.server_name, "postgres")
+    self.assertEqual(p.tool, "query")
+
+    cfg, _ = policy._to_policy_config_proto([p])
+    self.assertEqual(len(cfg.rules), 1)
+    self.assertEqual(cfg.rules[0].server_name, "postgres")
+    self.assertEqual(cfg.rules[0].tool, "query")
+    self.assertEqual(cfg.rules[0].deny_reason, "No raw DB queries")
+
+  async def test_explicit_server_name_hook_matching(self):
+    mcp_pg = types.McpStdioServer(name="postgres", command="cmd")
+    p_deny = policy.Policy(
+        tool="query",
+        decision=policy.Decision.DENY,
+        server_name="postgres",
+    )
+    p_wildcard = policy.Policy(
+        tool="*",
+        decision=policy.Decision.APPROVE,
+        server_name="postgres",
+    )
+    hook = policy.enforce([p_deny, p_wildcard], mcp_servers=[mcp_pg])
+    ctx = hooks.HookContext()
+
+    # 1. Matching tool on target server -> Denied
+    res = await hook.run(
+        ctx, types.ToolCall(name="query", server_name="postgres")
+    )
+    self.assertFalse(res.allow)
+
+    # 2. Other tool on same server -> Allowed by wildcard
+    res_other = await hook.run(
+        ctx, types.ToolCall(name="tables", server_name="postgres")
+    )
+    self.assertTrue(res_other.allow)
+
+    # 3. Same tool name on different server -> Not matched by this server's policy
+    res_diff_srv = await hook.run(
+        ctx, types.ToolCall(name="query", server_name="sqlite")
+    )
+    self.assertTrue(res_diff_srv.allow)
+
+
 if __name__ == "__main__":
   absltest.main()
